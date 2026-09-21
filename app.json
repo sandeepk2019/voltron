@@ -34,7 +34,8 @@
         "BLUETOOTH_ADMIN",
         "BLUETOOTH_SCAN",
         "BLUETOOTH_CONNECT",
-        "ACCESS_FINE_LOCATION"
+        "ACCESS_FINE_LOCATION",
+        "POST_NOTIFICATIONS"
       ]
     },
     "extra": {
@@ -44,7 +45,16 @@
       }
     },
     "plugins": [
-      "expo-asset"
+      "expo-asset",
+      "expo-sqlite",
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": false,
+          "modes": ["central"],
+          "bluetoothAlwaysPermission": "Allow Voltron Diagnostics to connect wirelessly to ELM327 OBD-II vehicle diagnostic adapters."
+        }
+      ]
     ]
   }
 }
