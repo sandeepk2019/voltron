@@ -36,12 +36,17 @@ import {
   stopBleScan,
   connectElm327,
   disconnectElm327,
+  startElm327Polling,
+  stopElm327Polling,
+  clearElm327TroubleCodes,
+  Elm327CanSample,
   BleAdapter,
 } from "../lib/bleElm327";
 import {
   registerForVoltronNotifications,
   showLocalAnomalyNotification,
 } from "../lib/notifications";
+import { exportTelemetryCertificate } from "../lib/offlinePdf";
 
 type UserProfile = {
   id: number;
@@ -134,6 +139,10 @@ export default function MobileHomeScreen() {
   const [connectedBleDevice, setConnectedBleDevice] = useState<string | null>(null);
   const [bleConnecting, setBleConnecting] = useState(false);
   const [bleStatusText, setBleStatusText] = useState("Ready to pair OBD-II");
+  const [canSample, setCanSample] = useState<Elm327CanSample | null>(null);
+  const [dtcClearing, setDtcClearing] = useState(false);
+  const [dtcStatus, setDtcStatus] = useState("");
+  const [pdfExportingId, setPdfExportingId] = useState<number | "current" | null>(null);
 
   // Offline SQLite history state
   const [historyModalVisible, setHistoryModalVisible] = useState(false);
@@ -261,6 +270,7 @@ export default function MobileHomeScreen() {
       clearInterval(statusTimer);
       unsubscribe();
       stopBleScan();
+      stopElm327Polling();
     };
   }, []);
 
@@ -578,6 +588,21 @@ export default function MobileHomeScreen() {
       await connectElm327(adapter.id);
       setConnectedBleDevice(adapter.id);
       setBleStatusText(`Connected to ${adapter.name} (Live OBD-II BLE)`);
+      startElm327Polling(
+        (sample) => {
+          setCanSample(sample);
+          setTelemetry((current) => {
+            if (!current) return current;
+            return {
+              ...current,
+              packVoltage: sample.packVoltageV ?? current.packVoltage,
+              packTempAvgC: sample.batteryTemperatureC ?? current.packTempAvgC,
+            };
+          });
+        },
+        (message) => setBleStatusText(message),
+        1500,
+      );
       Alert.alert("OBD-II Paired", `Wireless ELM327 link established with ${adapter.name}. Live telemetry is ready.`);
     } catch (err: any) {
       setBleStatusText(`Pairing failed: ${err?.message || "Timeout"}`);
@@ -590,9 +615,80 @@ export default function MobileHomeScreen() {
 
   const handleDisconnectBle = async () => {
     if (!connectedBleDevice) return;
+    stopElm327Polling();
     await disconnectElm327(connectedBleDevice);
     setConnectedBleDevice(null);
+    setCanSample(null);
     setBleStatusText("OBD-II adapter disconnected");
+  };
+
+  const handleClearTroubleCodes = async () => {
+    if (!connectedBleDevice) {
+      setDtcStatus("Pair an ELM327 adapter before requesting a DTC clear.");
+      return;
+    }
+    Alert.alert(
+      "Clear diagnostic trouble codes?",
+      "This sends standard OBD-II Service 04 to the vehicle. It may erase emissions-related fault records and will not repair the underlying fault.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Send Service 04",
+          style: "destructive",
+          onPress: async () => {
+            setDtcClearing(true);
+            setDtcStatus("Sending guarded OBD-II Service 04 request…");
+            try {
+              const result = await clearElm327TroubleCodes();
+              setDtcStatus(result.message);
+            } catch (error) {
+              setDtcStatus(error instanceof Error ? error.message : "DTC clear request failed.");
+            } finally {
+              setDtcClearing(false);
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const handleExportRecordPdf = async (record: TelemetryHistoryRecord, key: number | "current") => {
+    setPdfExportingId(key);
+    try {
+      await exportTelemetryCertificate(record);
+    } catch (error) {
+      Alert.alert("PDF export unavailable", error instanceof Error ? error.message : "Could not create the offline certificate.");
+    } finally {
+      setPdfExportingId(null);
+    }
+  };
+
+  const handleExportCurrentPdf = async () => {
+    if (!activeVehicle || !telemetry) return;
+    const record: Omit<TelemetryHistoryRecord, "id"> = {
+      vehicleId: activeVehicle.id,
+      vehicleName: `${activeVehicle.year} ${activeVehicle.make} ${activeVehicle.model}`,
+      capturedAt: new Date().toISOString(),
+      stateOfHealth: telemetry.stateOfHealth,
+      stateOfCharge: telemetry.stateOfCharge,
+      cellDeltaMv: telemetry.cellDeltaMv,
+      packVoltage: telemetry.packVoltage,
+      packTempAvgC: telemetry.packTempAvgC,
+      headlineVerdict: telemetry.headlineVerdict,
+      source: connectedBleDevice ? "ble" : "offline",
+      snapshotJson: JSON.stringify({
+        ...telemetry,
+        canSample,
+      }),
+    };
+    setPdfExportingId("current");
+    try {
+      await exportTelemetryCertificate(record);
+    } catch (error) {
+      Alert.alert("PDF export unavailable", error instanceof Error ? error.message : "Could not create the offline certificate.");
+    } finally {
+      setPdfExportingId(null);
+    }
   };
 
   const openScanner = async () => {
@@ -931,6 +1027,17 @@ export default function MobileHomeScreen() {
                     <Text style={styles.historyMetricText}>Temp: <Text style={styles.boldWhite}>{item.packTempAvgC.toFixed(1)}°C</Text></Text>
                   </View>
                   <Text style={styles.historyVerdict}>{item.headlineVerdict}</Text>
+                  <TouchableOpacity
+                    style={styles.pdfBtn}
+                    onPress={() => void handleExportRecordPdf(item, item.id)}
+                    disabled={pdfExportingId === item.id}
+                  >
+                    {pdfExportingId === item.id ? (
+                      <ActivityIndicator color="#05080b" size="small" />
+                    ) : (
+                      <Text style={styles.pdfBtnText}>Export offline PDF certificate</Text>
+                    )}
+                  </TouchableOpacity>
                 </View>
               ))
             )}
@@ -993,6 +1100,59 @@ export default function MobileHomeScreen() {
                 <Text style={styles.verdictSub}>
                   Isolation Resistance: {telemetry.isolationResistanceKohms} kΩ · Status: {telemetry.deltaStatus}
                 </Text>
+              </View>
+
+              <View style={styles.canCard}>
+                <View style={styles.canHeaderRow}>
+                  <View>
+                    <Text style={styles.canTitle}>LIVE CAN / OBD-II TELEMETRY</Text>
+                    <Text style={styles.canSub}>
+                      {connectedBleDevice ? "Polling standard generic PIDs over the paired ELM327 link." : "Pair an ELM327 adapter to poll the vehicle."}
+                    </Text>
+                  </View>
+                  <Text style={connectedBleDevice ? styles.canConnected : styles.canDisconnected}>
+                    {connectedBleDevice ? "CONNECTED" : "OFFLINE"}
+                  </Text>
+                </View>
+                <View style={styles.canMetricsRow}>
+                  <View style={styles.canMetric}>
+                    <Text style={styles.canMetricLabel}>PACK VOLTAGE</Text>
+                    <Text style={styles.canMetricValue}>{canSample?.packVoltageV != null ? `${canSample.packVoltageV.toFixed(2)} V` : "—"}</Text>
+                  </View>
+                  <View style={styles.canMetric}>
+                    <Text style={styles.canMetricLabel}>BATTERY TEMP</Text>
+                    <Text style={styles.canMetricValue}>{canSample?.batteryTemperatureC != null ? `${canSample.batteryTemperatureC.toFixed(1)} °C` : "—"}</Text>
+                  </View>
+                  <View style={styles.canMetric}>
+                    <Text style={styles.canMetricLabel}>ADAPTER VOLTAGE</Text>
+                    <Text style={styles.canMetricValue}>{canSample?.adapterVoltageV != null ? `${canSample.adapterVoltageV.toFixed(1)} V` : "—"}</Text>
+                  </View>
+                </View>
+                {canSample ? (
+                  <Text style={styles.canSub}>
+                    Last sample {new Date(canSample.capturedAt).toLocaleTimeString()} · Generic PID support: {canSample.supportedPids.length ? canSample.supportedPids.join(", ") : "none reported"}
+                  </Text>
+                ) : null}
+                <Text style={styles.canDisclaimer}>
+                  Generic OBD-II does not expose a universal 96-cell or module-temperature PID. OEM Mode 22 mappings are intentionally reported as unavailable until configured.
+                </Text>
+                <View style={styles.actionRow}>
+                  <TouchableOpacity
+                    style={styles.dtcBtn}
+                    onPress={() => void handleClearTroubleCodes()}
+                    disabled={dtcClearing || !connectedBleDevice}
+                  >
+                    {dtcClearing ? <ActivityIndicator color="#ffffff" size="small" /> : <Text style={styles.dtcBtnText}>Clear DTCs (Service 04)</Text>}
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.pdfBtn}
+                    onPress={() => void handleExportCurrentPdf()}
+                    disabled={pdfExportingId === "current"}
+                  >
+                    {pdfExportingId === "current" ? <ActivityIndicator color="#05080b" size="small" /> : <Text style={styles.pdfBtnText}>Export PDF</Text>}
+                  </TouchableOpacity>
+                </View>
+                {dtcStatus ? <Text style={styles.dtcStatus}>{dtcStatus}</Text> : null}
               </View>
 
               {/* Metric Selector Tabs */}
@@ -1521,6 +1681,17 @@ const styles = StyleSheet.create({
   historyMetricText: { fontSize: 11, color: "#94a3b8" },
   boldWhite: { color: "#ffffff", fontWeight: "bold" },
   historyVerdict: { fontSize: 11, color: "#cbd5e1", marginTop: 6, lineHeight: 15 },
+  pdfBtn: {
+    backgroundColor: "#10b981",
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: 34,
+    marginTop: 10,
+  },
+  pdfBtnText: { color: "#05080b", fontSize: 11, fontWeight: "bold" },
 
   /* Modal Base */
   modalOverlay: {
@@ -1645,6 +1816,36 @@ const styles = StyleSheet.create({
   verdictTitle: { fontSize: 10, color: "#10b981", fontWeight: "bold", letterSpacing: 0.8 },
   verdictText: { fontSize: 12, color: "#ffffff", marginTop: 4, lineHeight: 18, fontWeight: "500" },
   verdictSub: { fontSize: 10, color: "#94a3b8", marginTop: 4 },
+  canCard: {
+    backgroundColor: "#071d2a",
+    borderColor: "#0e7490",
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 14,
+  },
+  canHeaderRow: { flexDirection: "row", justifyContent: "space-between", gap: 8, alignItems: "flex-start" },
+  canTitle: { fontSize: 10, color: "#67e8f9", fontWeight: "bold", letterSpacing: 0.7 },
+  canSub: { fontSize: 10, color: "#94a3b8", marginTop: 4, lineHeight: 14 },
+  canConnected: { color: "#34d399", fontSize: 9, fontWeight: "bold" },
+  canDisconnected: { color: "#fbbf24", fontSize: 9, fontWeight: "bold" },
+  canMetricsRow: { flexDirection: "row", gap: 8, marginTop: 10 },
+  canMetric: { flex: 1, backgroundColor: "#0f172a", borderRadius: 8, padding: 8 },
+  canMetricLabel: { color: "#64748b", fontSize: 8, fontWeight: "bold" },
+  canMetricValue: { color: "#ffffff", fontSize: 14, fontWeight: "bold", marginTop: 3 },
+  canDisclaimer: { color: "#fbbf24", fontSize: 10, lineHeight: 14, marginTop: 8 },
+  actionRow: { flexDirection: "row", gap: 8, marginTop: 8 },
+  dtcBtn: {
+    flex: 1,
+    backgroundColor: "#991b1b",
+    borderRadius: 8,
+    paddingVertical: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: 34,
+  },
+  dtcBtnText: { color: "#ffffff", fontSize: 10, fontWeight: "bold", textAlign: "center" },
+  dtcStatus: { color: "#cbd5e1", fontSize: 10, lineHeight: 14, marginTop: 8 },
   metricTabs: { flexDirection: "row", gap: 8, marginBottom: 12 },
   metricTab: {
     flex: 1,
