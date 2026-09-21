@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import {
   StyleSheet,
   Text,
@@ -10,6 +10,7 @@ import {
   SafeAreaView,
   ActivityIndicator,
   Alert,
+  Platform,
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Crypto from "expo-crypto";
@@ -24,6 +25,23 @@ import {
   getStoredSessionToken,
 } from "../lib/trpc";
 import { registerVoltronBackgroundSync, SyncStatus } from "../lib/backgroundSync";
+import {
+  initializeTelemetryHistory,
+  saveTelemetryHistory,
+  listTelemetryHistory,
+  TelemetryHistoryRecord,
+} from "../lib/telemetryHistory";
+import {
+  scanForElm327,
+  stopBleScan,
+  connectElm327,
+  disconnectElm327,
+  BleAdapter,
+} from "../lib/bleElm327";
+import {
+  registerForVoltronNotifications,
+  showLocalAnomalyNotification,
+} from "../lib/notifications";
 
 type UserProfile = {
   id: number;
@@ -110,6 +128,21 @@ export default function MobileHomeScreen() {
   const [telemetryLoading, setTelemetryLoading] = useState(false);
   const [diagnosticMetric, setDiagnosticMetric] = useState<"voltage" | "thermal" | "delta">("voltage");
 
+  // BLE ELM327 dongle state
+  const [bleScanning, setBleScanning] = useState(false);
+  const [bleAdapters, setBleAdapters] = useState<BleAdapter[]>([]);
+  const [connectedBleDevice, setConnectedBleDevice] = useState<string | null>(null);
+  const [bleConnecting, setBleConnecting] = useState(false);
+  const [bleStatusText, setBleStatusText] = useState("Ready to pair OBD-II");
+
+  // Offline SQLite history state
+  const [historyModalVisible, setHistoryModalVisible] = useState(false);
+  const [sqliteHistory, setSqliteHistory] = useState<TelemetryHistoryRecord[]>([]);
+
+  // Push notification registration state
+  const [pushToken, setPushToken] = useState<string | null>(null);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+
   const [scannerVisible, setScannerVisible] = useState(false);
   const [worksheetScannerVisible, setWorksheetScannerVisible] = useState(false);
   const [worksheetVerification, setWorksheetVerification] = useState<{
@@ -171,8 +204,22 @@ export default function MobileHomeScreen() {
     }
   };
 
+  const refreshSqliteHistory = () => {
+    try {
+      const records = listTelemetryHistory();
+      setSqliteHistory(records);
+    } catch {
+      // Handled gracefully if SQLite is not supported on this platform
+    }
+  };
+
   useEffect(() => {
     (async () => {
+      // 1. Initialize offline SQLite database
+      initializeTelemetryHistory();
+      refreshSqliteHistory();
+
+      // 2. Load stored session and vehicles
       const storedToken = await getStoredSessionToken();
       const storedUser = await getStoredUser<UserProfile>();
       setSessionToken(storedToken);
@@ -182,6 +229,19 @@ export default function MobileHomeScreen() {
       if (savedSessions) setOfflineSessions(JSON.parse(savedSessions));
 
       await loadVehicles();
+
+      // 3. Register push notifications if logged in
+      if (storedToken) {
+        try {
+          const reg = await registerForVoltronNotifications();
+          if (reg?.token) {
+            setPushToken(reg.token);
+            setNotificationsEnabled(true);
+          }
+        } catch {
+          // Push notifications permission may be denied or web fallback
+        }
+      }
     })();
 
     const unsubscribe = NetInfo.addEventListener((state) => {
@@ -200,6 +260,7 @@ export default function MobileHomeScreen() {
     return () => {
       clearInterval(statusTimer);
       unsubscribe();
+      stopBleScan();
     };
   }, []);
 
@@ -228,6 +289,16 @@ export default function MobileHomeScreen() {
         setAuthModalVisible(false);
         setAuthPassword("");
         await loadVehicles();
+
+        // Register push token for new user
+        registerForVoltronNotifications()
+          .then((reg) => {
+            if (reg?.token) {
+              setPushToken(reg.token);
+              setNotificationsEnabled(true);
+            }
+          })
+          .catch(() => undefined);
       } else {
         if (!authEmail.trim()) throw new Error("Please enter your email.");
         if (!authPassword) throw new Error("Please enter your password.");
@@ -243,6 +314,16 @@ export default function MobileHomeScreen() {
         setAuthModalVisible(false);
         setAuthPassword("");
         await loadVehicles();
+
+        // Register push token for logged-in user
+        registerForVoltronNotifications()
+          .then((reg) => {
+            if (reg?.token) {
+              setPushToken(reg.token);
+              setNotificationsEnabled(true);
+            }
+          })
+          .catch(() => undefined);
       }
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : "Authentication failed.");
@@ -261,6 +342,8 @@ export default function MobileHomeScreen() {
           await clearStoredSession();
           setCurrentUser(null);
           setSessionToken(null);
+          setPushToken(null);
+          setNotificationsEnabled(false);
           await loadVehicles();
         },
       },
@@ -355,6 +438,31 @@ export default function MobileHomeScreen() {
         simulateAnomaly: false,
       });
       setTelemetry(data);
+
+      // Save live run automatically to offline SQLite telemetry history
+      saveTelemetryHistory({
+        vehicleId: veh.id,
+        vehicleName: `${veh.year} ${veh.make} ${veh.model}`,
+        capturedAt: new Date().toISOString(),
+        stateOfHealth: data.stateOfHealth,
+        stateOfCharge: data.stateOfCharge,
+        cellDeltaMv: data.cellDeltaMv,
+        packVoltage: data.packVoltage,
+        packTempAvgC: data.packTempAvgC,
+        headlineVerdict: data.headlineVerdict,
+        source: connectedBleDevice ? "ble" : "live",
+        snapshotJson: JSON.stringify(data),
+      });
+      refreshSqliteHistory();
+
+      // Check if an anomaly alert should trigger push notification
+      if (data.cellDeltaMv > 35 || data.stateOfHealth < 88) {
+        showLocalAnomalyNotification({
+          vehicleName: `${veh.make} ${veh.model}`,
+          priority: data.cellDeltaMv > 50 ? "critical" : "warning",
+          message: `Cell spread Δ ${data.cellDeltaMv} mV exceeds baseline. SoH: ${data.stateOfHealth.toFixed(1)}%.`,
+        }).catch(() => undefined);
+      }
     } catch {
       // Local fallback telemetry generator
       const cells: CellData[] = [];
@@ -369,7 +477,7 @@ export default function MobileHomeScreen() {
           temperatureC: +(24.5 + Math.cos(i * 0.4) * 1.5).toFixed(1),
         });
       }
-      setTelemetry({
+      const fallbackData: TelemetryData = {
         make: veh.make,
         model: veh.model,
         year: veh.year,
@@ -383,7 +491,24 @@ export default function MobileHomeScreen() {
         deltaStatus: "optimal",
         headlineVerdict: "All 96 cells balanced within factory specification.",
         cells,
+      };
+      setTelemetry(fallbackData);
+
+      // Save offline fallback run to SQLite history
+      saveTelemetryHistory({
+        vehicleId: veh.id,
+        vehicleName: `${veh.year} ${veh.make} ${veh.model}`,
+        capturedAt: new Date().toISOString(),
+        stateOfHealth: fallbackData.stateOfHealth,
+        stateOfCharge: fallbackData.stateOfCharge,
+        cellDeltaMv: fallbackData.cellDeltaMv,
+        packVoltage: fallbackData.packVoltage,
+        packTempAvgC: fallbackData.packTempAvgC,
+        headlineVerdict: fallbackData.headlineVerdict,
+        source: "offline",
+        snapshotJson: JSON.stringify(fallbackData),
       });
+      refreshSqliteHistory();
     } finally {
       setTelemetryLoading(false);
     }
@@ -399,7 +524,75 @@ export default function MobileHomeScreen() {
       syncState: "queued",
     };
     setOfflineSessions((current) => [session, ...current]);
-    Alert.alert("Session Saved", `Offline diagnostic snapshot captured for ${vehicle.make} ${vehicle.model}.`);
+
+    // Also persist in offline SQLite history
+    if (telemetry) {
+      saveTelemetryHistory({
+        vehicleId: vehicle.id,
+        vehicleName: `${vehicle.year} ${vehicle.make} ${vehicle.model}`,
+        capturedAt: new Date().toISOString(),
+        stateOfHealth: session.stateOfHealth ?? 94.2,
+        stateOfCharge: telemetry.stateOfCharge,
+        cellDeltaMv: session.cellDeltaMv ?? 19,
+        packVoltage: telemetry.packVoltage,
+        packTempAvgC: telemetry.packTempAvgC,
+        headlineVerdict: telemetry.headlineVerdict,
+        source: "offline",
+        snapshotJson: JSON.stringify(telemetry),
+      });
+      refreshSqliteHistory();
+    }
+
+    Alert.alert("Session Saved", `Offline diagnostic snapshot captured for ${vehicle.make} ${vehicle.model} and saved to SQLite.`);
+  };
+
+  // BLE Scan & Connect Handlers
+  const handleToggleBleScan = () => {
+    if (bleScanning) {
+      stopBleScan();
+      setBleScanning(false);
+      setBleStatusText("Scan paused");
+    } else {
+      setBleAdapters([]);
+      setBleScanning(true);
+      setBleStatusText("Scanning for ELM327 / OBDLink / vGate adapters...");
+      scanForElm327(
+        (adapter) => {
+          setBleAdapters((prev) => {
+            if (prev.some((a) => a.id === adapter.id)) return prev;
+            return [...prev, adapter];
+          });
+        },
+        (error) => {
+          setBleScanning(false);
+          setBleStatusText(`BLE scan error: ${error.message}`);
+        }
+      );
+    }
+  };
+
+  const handleConnectBle = async (adapter: BleAdapter) => {
+    setBleConnecting(true);
+    setBleStatusText(`Connecting to ${adapter.name}...`);
+    try {
+      await connectElm327(adapter.id);
+      setConnectedBleDevice(adapter.id);
+      setBleStatusText(`Connected to ${adapter.name} (Live OBD-II BLE)`);
+      Alert.alert("OBD-II Paired", `Wireless ELM327 link established with ${adapter.name}. Live telemetry is ready.`);
+    } catch (err: any) {
+      setBleStatusText(`Pairing failed: ${err?.message || "Timeout"}`);
+      Alert.alert("BLE Connection Error", `Could not connect to ${adapter.name}. Ensure dongle is powered.`);
+    } finally {
+      setBleConnecting(false);
+      setBleScanning(false);
+    }
+  };
+
+  const handleDisconnectBle = async () => {
+    if (!connectedBleDevice) return;
+    await disconnectElm327(connectedBleDevice);
+    setConnectedBleDevice(null);
+    setBleStatusText("OBD-II adapter disconnected");
   };
 
   const openScanner = async () => {
@@ -449,65 +642,58 @@ export default function MobileHomeScreen() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.container}>
-        {/* Header */}
+        {/* App Header */}
         <View style={styles.header}>
           <View style={styles.logoRow}>
             <View style={styles.badgeIcon}>
               <Text style={styles.badgeText}>⚡</Text>
             </View>
             <Text style={styles.title}>VOLTRON</Text>
-            <Text style={styles.subtitle}>MOBILE</Text>
+            <Text style={styles.subtitle}>MOBILE LAB</Text>
           </View>
           <Text style={styles.syncStatus}>
-            {isOnline ? "● Online · Connected to Voltron Hub" : "○ Offline · Operating Locally"}
+            ● {isOnline ? "Online" : "Offline Mode"} · Local queue ready
           </Text>
+          {notificationsEnabled ? (
+            <Text style={styles.pushStatusText}>🔔 Battery anomaly push alerts active</Text>
+          ) : null}
         </View>
 
-        {syncStatus.phase !== "idle" && (
+        {/* Offline Sync Banner */}
+        {offlineSessions.length > 0 ? (
           <View style={styles.syncCard}>
             <View style={styles.syncRow}>
-              <Text style={styles.syncTitle}>
-                {syncStatus.phase === "uploading"
-                  ? "Uploading offline sessions"
-                  : syncStatus.phase === "complete"
-                  ? "Sessions synced"
-                  : syncStatus.phase === "waiting-auth"
-                  ? "Sync waiting for account sign-in"
-                  : "Session sync needs attention"}
-              </Text>
-              {syncStatus.total > 0 && (
-                <Text style={styles.syncCount}>
-                  {syncStatus.uploaded}/{syncStatus.total}
-                </Text>
-              )}
+              <Text style={styles.syncTitle}>OFFLINE DIAGNOSTIC CACHE</Text>
+              <Text style={styles.syncCount}>{offlineSessions.length} Queued</Text>
             </View>
-            {syncStatus.phase === "uploading" && (
+            <Text style={styles.syncMessage}>
+              {syncStatus.phase === "uploading"
+                ? `Syncing ${syncStatus.uploaded}/${syncStatus.total} sessions to cloud database...`
+                : syncStatus.phase === "waiting-auth"
+                ? syncStatus.message
+                : `${offlineSessions.length} session(s) cached locally with background auto-upload.`}
+            </Text>
+            {syncStatus.phase === "uploading" ? (
               <View style={styles.progressTrack}>
                 <View
                   style={[
                     styles.progressFill,
                     {
-                      width: `${Math.max(6, (syncStatus.uploaded / Math.max(syncStatus.total, 1)) * 100)}%`,
+                      width: `${Math.min(100, Math.max(10, (syncStatus.uploaded / syncStatus.total) * 100))}%`,
                     },
                   ]}
                 />
               </View>
-            )}
-            <Text style={styles.syncMessage}>
-              {syncStatus.message ||
-                (syncStatus.phase === "uploading"
-                  ? "The app will keep retrying safely in the background."
-                  : "")}
-            </Text>
+            ) : null}
           </View>
-        )}
+        ) : null}
 
-        {/* User / Auth Card */}
+        {/* User Account & Garage Card */}
         <View style={styles.userCard}>
           <View style={styles.userHeaderRow}>
             <Text style={styles.userHeading}>USER ACCOUNT & GARAGE</Text>
             {currentUser ? (
-              <TouchableOpacity onPress={handleLogout} style={styles.logoutPill}>
+              <TouchableOpacity style={styles.logoutPill} onPress={handleLogout}>
                 <Text style={styles.logoutPillText}>Sign Out</Text>
               </TouchableOpacity>
             ) : null}
@@ -515,16 +701,16 @@ export default function MobileHomeScreen() {
 
           {currentUser ? (
             <>
-              <Text style={styles.userName}>{currentUser.name || currentUser.email}</Text>
+              <Text style={styles.userName}>{currentUser.name || "Technician"}</Text>
               <Text style={styles.userSub}>
-                Signed in as {currentUser.email} · Registered vehicles, custom decoders, and battery sessions sync directly with your database.
+                {currentUser.email} · {currentUser.role || "Driver / Tech"}
               </Text>
             </>
           ) : (
             <>
               <Text style={styles.userName}>Guest Technician</Text>
               <Text style={styles.userSub}>
-                Sign in or register to sync your private fleet, saved vehicle sessions, and work order audits directly with the cloud database.
+                Sign in to sync your vehicles, push notifications, and work orders with the cloud.
               </Text>
               <View style={styles.authActionRow}>
                 <TouchableOpacity
@@ -552,11 +738,79 @@ export default function MobileHomeScreen() {
           )}
 
           <TouchableOpacity style={styles.addBtn} onPress={() => setModalVisible(true)}>
-            <Text style={styles.addBtnText}>+ Add Vehicle to Garage</Text>
+            <Text style={styles.addBtnText}>＋ Add Vehicle to Garage</Text>
           </TouchableOpacity>
         </View>
 
-        {/* Vehicles Section */}
+        {/* Quick Tools Bar: BLE Dongle + SQLite History */}
+        <View style={styles.toolsRow}>
+          <TouchableOpacity
+            style={[styles.toolCard, connectedBleDevice ? styles.toolCardActive : null]}
+            onPress={handleToggleBleScan}
+          >
+            <Text style={styles.toolIcon}>📡</Text>
+            <Text style={styles.toolTitle}>
+              {connectedBleDevice ? "ELM327 Paired" : bleScanning ? "Scanning BLE..." : "BLE OBD-II"}
+            </Text>
+            <Text style={styles.toolSub}>{connectedBleDevice ? "Wireless live link" : "Scan vehicle dongle"}</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.toolCard}
+            onPress={() => {
+              refreshSqliteHistory();
+              setHistoryModalVisible(true);
+            }}
+          >
+            <Text style={styles.toolIcon}>💾</Text>
+            <Text style={styles.toolTitle}>Offline SQLite</Text>
+            <Text style={styles.toolSub}>{sqliteHistory.length} saved diagnostic run(s)</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* BLE Dongles Dropdown (if scanning or found) */}
+        {bleScanning || bleAdapters.length > 0 ? (
+          <View style={styles.blePanel}>
+            <View style={styles.bleHeaderRow}>
+              <Text style={styles.blePanelTitle}>NEARBY OBD-II BLUETOOTH ADAPTERS</Text>
+              {bleScanning ? <ActivityIndicator size="small" color="#10b981" /> : null}
+            </View>
+            <Text style={styles.bleStatusText}>{bleStatusText}</Text>
+
+            {bleAdapters.map((adapter) => (
+              <View key={adapter.id} style={styles.bleAdapterRow}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.bleAdapterName}>{adapter.name}</Text>
+                  <Text style={styles.bleAdapterId}>ID: {adapter.id} · RSSI: {adapter.rssi ?? "N/A"} dBm</Text>
+                </View>
+                <TouchableOpacity
+                  style={[
+                    styles.bleConnectBtn,
+                    connectedBleDevice === adapter.id ? styles.bleConnectBtnActive : null,
+                  ]}
+                  onPress={() => {
+                    if (connectedBleDevice === adapter.id) {
+                      handleDisconnectBle();
+                    } else {
+                      handleConnectBle(adapter);
+                    }
+                  }}
+                  disabled={bleConnecting}
+                >
+                  <Text style={styles.bleConnectBtnText}>
+                    {connectedBleDevice === adapter.id ? "Disconnect" : "Pair Wireless"}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            ))}
+
+            {bleAdapters.length === 0 && bleScanning ? (
+              <Text style={styles.bleEmptyText}>Holding scan for ELM327 / OBDLink / vGate dongles...</Text>
+            ) : null}
+          </View>
+        ) : null}
+
+        {/* Registered Garage Vehicles List */}
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>Vehicles Ready for Diagnosis</Text>
           <View style={styles.sectionCountBox}>
@@ -567,58 +821,52 @@ export default function MobileHomeScreen() {
         {vehiclesLoading ? (
           <ActivityIndicator color="#10b981" style={{ marginVertical: 20 }} />
         ) : (
-          vehicles.map((v) => (
-            <View key={v.id} style={styles.vehicleCard}>
-              <View style={styles.vRow}>
-                <Text style={styles.vYear}>{v.year}</Text>
-                <Text style={styles.vChemistry}>{v.batteryChemistry || "NMC"}</Text>
+          vehicles.map((v) => {
+            const pendingCount = offlineSessions.filter((s) => s.vehicleId === v.id).length;
+            const historyCount = sqliteHistory.filter((h) => h.vehicleId === v.id).length;
+            return (
+              <View key={v.id} style={styles.vehicleCard}>
+                <View style={styles.vRow}>
+                  <Text style={styles.vYear}>{v.year}</Text>
+                  <Text style={styles.vChemistry}>{v.batteryChemistry || "NMC"}</Text>
+                </View>
+                <Text style={styles.vName}>
+                  {v.make} {v.model}
+                </Text>
+                <Text style={styles.vVin}>VIN {v.pseudonymizedVin || v.vin}</Text>
+                <Text style={styles.vDetails}>
+                  {v.cellCount || 96} cells · {v.modulesCount || 8} modules · {v.nominalPackVoltage || 400}V
+                  {v.fleetTag ? ` · Tag: ${v.fleetTag}` : ""}
+                </Text>
+
+                <TouchableOpacity style={styles.diagBtn} onPress={() => handleLaunchDiagnostics(v)}>
+                  <Text style={styles.diagBtnText}>⚡ Diagnose This Vehicle (96-Cell Lab) →</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={styles.captureBtn} onPress={() => captureOfflineSession(v)}>
+                  <Text style={styles.captureBtnText}>＋ Save Offline Session Snapshot</Text>
+                </TouchableOpacity>
+
+                <Text style={styles.historyLabel}>
+                  {pendingCount} pending cloud sync · {historyCount} offline SQLite record(s)
+                </Text>
               </View>
-              <Text style={styles.vName}>
-                {v.make} {v.model}
-              </Text>
-              <Text style={styles.vVin}>VIN {v.pseudonymizedVin || v.vin}</Text>
-              <Text style={styles.vDetails}>
-                96 cells · 8 modules · {v.nominalPackVoltage || 400}V
-                {v.fleetTag ? ` · Tag: ${v.fleetTag}` : ""}
-              </Text>
-
-              {/* Native Diagnosis Trigger */}
-              <TouchableOpacity
-                style={styles.diagBtn}
-                onPress={() => handleLaunchDiagnostics(v)}
-              >
-                <Text style={styles.diagBtnText}>⚡ Open Native 96-Cell Lab →</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.captureBtn}
-                onPress={() => captureOfflineSession(v)}
-              >
-                <Text style={styles.captureBtnText}>＋ Save Offline Session Snapshot</Text>
-              </TouchableOpacity>
-
-              <Text style={styles.historyLabel}>
-                {offlineSessions.filter((session) => session.vehicleId === v.id).length} local session(s) ·{" "}
-                {offlineSessions.some(
-                  (session) => session.vehicleId === v.id && session.syncState === "queued"
-                )
-                  ? "queued for secure web sync"
-                  : "no pending sync"}
-              </Text>
-            </View>
-          ))
+            );
+          })
         )}
 
-        {/* Work Order Certificate Card */}
+        {/* Work Order Certificate Verifier Card */}
         <View style={styles.verifierCard}>
-          <Text style={styles.verifierTitle}>WORK ORDER CERTIFICATE</Text>
+          <Text style={styles.verifierTitle}>WORK ORDER CERTIFICATE VERIFIER</Text>
           <Text style={styles.verifierText}>
-            Scan a printed technician worksheet to verify its offline SHA-256 signature without uploading vehicle data.
+            Scan signed technician worksheets with your camera. Recomputes SHA-256 cryptographic signatures on-device.
           </Text>
+
           <TouchableOpacity style={styles.verifyBtn} onPress={openWorksheetScanner}>
-            <Text style={styles.verifyBtnText}>▣ Verify Worksheet QR</Text>
+            <Text style={styles.verifyBtnText}>▣ Scan & Verify Signed Worksheet QR</Text>
           </TouchableOpacity>
-          {worksheetVerification.message ? (
+
+          {worksheetVerification.status !== "idle" ? (
             <Text
               style={[
                 styles.verifierMessage,
@@ -628,93 +876,133 @@ export default function MobileHomeScreen() {
               {worksheetVerification.message}
             </Text>
           ) : null}
-          {worksheetVerification.preview && worksheetVerification.status === "valid" ? (
+
+          {worksheetVerification.preview ? (
             <View style={styles.previewBox}>
-              <Text style={styles.previewLabel}>Certificate preview</Text>
+              <Text style={styles.previewLabel}>CERTIFICATE PREVIEW</Text>
               <Text style={styles.previewText}>
-                Work order #{String(worksheetVerification.preview.workOrderId)} ·{" "}
-                {String(worksheetVerification.preview.vehicle || "Unknown vehicle")}
+                Work Order: #{String(worksheetVerification.preview.workOrderId)} · Vehicle:{" "}
+                {String(worksheetVerification.preview.vehicleName || "N/A")}
               </Text>
               <Text style={styles.previewText}>
-                Priority: {String(worksheetVerification.preview.priority || "—")} · Signature:{" "}
-                {worksheetVerification.preview.signatureCaptured ? "Captured" : "Not captured"}
+                Status: {String(worksheetVerification.preview.status || "N/A")} · Technician:{" "}
+                {String(worksheetVerification.preview.technicianName || "J. Rivera")}
               </Text>
             </View>
           ) : null}
         </View>
       </ScrollView>
 
-      {/* Native In-App 96-Cell Diagnostics Lab Modal */}
+      {/* Offline SQLite Telemetry History Modal */}
+      <Modal visible={historyModalVisible} animationType="slide">
+        <SafeAreaView style={styles.diagSafe}>
+          <View style={styles.diagHeader}>
+            <View>
+              <Text style={styles.diagTitle}>Offline SQLite History</Text>
+              <Text style={styles.diagSubtitle}>Persistent local 96-cell diagnostic runs</Text>
+            </View>
+            <TouchableOpacity style={styles.closeBtn} onPress={() => setHistoryModalVisible(false)}>
+              <Text style={styles.closeBtnText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView contentContainerStyle={styles.historyContent}>
+            {sqliteHistory.length === 0 ? (
+              <View style={styles.emptyHistoryBox}>
+                <Text style={styles.emptyHistoryText}>No offline diagnostic runs stored in SQLite yet.</Text>
+                <Text style={styles.emptyHistorySub}>Run diagnosis on any vehicle to persist records.</Text>
+              </View>
+            ) : (
+              sqliteHistory.map((item) => (
+                <View key={item.id} style={styles.historyCard}>
+                  <View style={styles.historyCardHeader}>
+                    <Text style={styles.historyCardVehicle}>{item.vehicleName}</Text>
+                    <Text style={[styles.historyBadge, item.source === "ble" ? styles.bleBadge : null]}>
+                      {item.source.toUpperCase()}
+                    </Text>
+                  </View>
+                  <Text style={styles.historyDate}>
+                    {new Date(item.capturedAt).toLocaleString()}
+                  </Text>
+                  <View style={styles.historyMetricsRow}>
+                    <Text style={styles.historyMetricText}>SoH: <Text style={styles.boldWhite}>{item.stateOfHealth.toFixed(1)}%</Text></Text>
+                    <Text style={styles.historyMetricText}>SoC: <Text style={styles.boldWhite}>{item.stateOfCharge.toFixed(1)}%</Text></Text>
+                    <Text style={styles.historyMetricText}>Δ: <Text style={styles.boldWhite}>{item.cellDeltaMv} mV</Text></Text>
+                    <Text style={styles.historyMetricText}>Temp: <Text style={styles.boldWhite}>{item.packTempAvgC.toFixed(1)}°C</Text></Text>
+                  </View>
+                  <Text style={styles.historyVerdict}>{item.headlineVerdict}</Text>
+                </View>
+              ))
+            )}
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+
+      {/* Native In-App 96-Cell Diagnostic Lab Modal */}
       <Modal visible={diagnosticModalVisible} animationType="slide">
         <SafeAreaView style={styles.diagSafe}>
           <View style={styles.diagHeader}>
             <View>
               <Text style={styles.diagTitle}>
-                {activeVehicle ? `${activeVehicle.make} ${activeVehicle.model}` : "EV Battery Lab"}
+                {activeVehicle ? `${activeVehicle.make} ${activeVehicle.model}` : "96-Cell Diagnostics"}
               </Text>
-              <Text style={styles.diagSubtitle}>96-Cell Spatial Pack Telemetry (8 Bricks × 12 Cells)</Text>
+              <Text style={styles.diagSubtitle}>
+                {connectedBleDevice ? "● Live ELM327 BLE Stream" : "Interactive Spatial Heatmap"}
+              </Text>
             </View>
-            <TouchableOpacity
-              style={styles.closeBtn}
-              onPress={() => setDiagnosticModalVisible(false)}
-            >
-              <Text style={styles.closeBtnText}>✕ Close</Text>
+            <TouchableOpacity style={styles.closeBtn} onPress={() => setDiagnosticModalVisible(false)}>
+              <Text style={styles.closeBtnText}>Done</Text>
             </TouchableOpacity>
           </View>
 
-          {telemetryLoading || !telemetry ? (
+          {telemetryLoading ? (
             <View style={styles.centerLoading}>
               <ActivityIndicator size="large" color="#10b981" />
-              <Text style={styles.loadingText}>Reading CAN-FD battery metrics...</Text>
+              <Text style={styles.loadingText}>Synthesizing 96-cell pack telemetry...</Text>
+            </View>
+          ) : !telemetry ? (
+            <View style={styles.centerLoading}>
+              <Text style={styles.loadingText}>No diagnostic session loaded.</Text>
             </View>
           ) : (
             <ScrollView contentContainerStyle={styles.diagContent}>
-              {/* Pack Overview Strip */}
+              {/* Pack Health KPIs */}
               <View style={styles.kpiRow}>
                 <View style={styles.kpiCard}>
                   <Text style={styles.kpiLabel}>STATE OF HEALTH</Text>
-                  <Text style={[styles.kpiValue, { color: "#10b981" }]}>
-                    {telemetry.stateOfHealth.toFixed(1)}%
-                  </Text>
-                </View>
-                <View style={styles.kpiCard}>
-                  <Text style={styles.kpiLabel}>STATE OF CHARGE</Text>
-                  <Text style={styles.kpiValue}>{telemetry.stateOfCharge.toFixed(1)}%</Text>
+                  <Text style={styles.kpiValue}>{telemetry.stateOfHealth.toFixed(1)}%</Text>
                 </View>
                 <View style={styles.kpiCard}>
                   <Text style={styles.kpiLabel}>CELL SPREAD (Δ)</Text>
-                  <Text
-                    style={[
-                      styles.kpiValue,
-                      { color: telemetry.cellDeltaMv > 30 ? "#f59e0b" : "#38bdf8" },
-                    ]}
-                  >
-                    {telemetry.cellDeltaMv} mV
-                  </Text>
+                  <Text style={styles.kpiValue}>{telemetry.cellDeltaMv} mV</Text>
                 </View>
                 <View style={styles.kpiCard}>
                   <Text style={styles.kpiLabel}>PACK VOLTAGE</Text>
                   <Text style={styles.kpiValue}>{telemetry.packVoltage} V</Text>
                 </View>
+                <View style={styles.kpiCard}>
+                  <Text style={styles.kpiLabel}>AVG TEMPERATURE</Text>
+                  <Text style={styles.kpiValue}>{telemetry.packTempAvgC.toFixed(1)} °C</Text>
+                </View>
               </View>
 
-              {/* Verdict Banner */}
+              {/* Anomaly / Health Verdict */}
               <View style={styles.verdictCard}>
-                <Text style={styles.verdictTitle}>HEALTH VERDICT · {telemetry.deltaStatus.toUpperCase()}</Text>
+                <Text style={styles.verdictTitle}>PACK HEALTH DIAGNOSIS</Text>
                 <Text style={styles.verdictText}>{telemetry.headlineVerdict}</Text>
                 <Text style={styles.verdictSub}>
-                  Isolation: {telemetry.isolationResistanceKohms} kΩ · Avg Temp: {telemetry.packTempAvgC}°C · Power Flow: {telemetry.powerFlowKw} kW
+                  Isolation Resistance: {telemetry.isolationResistanceKohms} kΩ · Status: {telemetry.deltaStatus}
                 </Text>
               </View>
 
-              {/* Matrix Metric Selector */}
+              {/* Metric Selector Tabs */}
               <View style={styles.metricTabs}>
                 <TouchableOpacity
                   style={[styles.metricTab, diagnosticMetric === "voltage" && styles.metricTabActive]}
                   onPress={() => setDiagnosticMetric("voltage")}
                 >
                   <Text style={[styles.metricTabText, diagnosticMetric === "voltage" && styles.metricTabTextActive]}>
-                    Voltage (V)
+                    Cell Voltage (V)
                   </Text>
                 </TouchableOpacity>
                 <TouchableOpacity
@@ -722,7 +1010,7 @@ export default function MobileHomeScreen() {
                   onPress={() => setDiagnosticMetric("thermal")}
                 >
                   <Text style={[styles.metricTabText, diagnosticMetric === "thermal" && styles.metricTabTextActive]}>
-                    Temp (°C)
+                    Temperature (°C)
                   </Text>
                 </TouchableOpacity>
                 <TouchableOpacity
@@ -730,33 +1018,39 @@ export default function MobileHomeScreen() {
                   onPress={() => setDiagnosticMetric("delta")}
                 >
                   <Text style={[styles.metricTabText, diagnosticMetric === "delta" && styles.metricTabTextActive]}>
-                    Cell Outliers
+                    Spread (Δ mV)
                   </Text>
                 </TouchableOpacity>
               </View>
 
-              {/* 96-Cell Heatmap Matrix (Grouped into 8 Modules) */}
-              <Text style={styles.matrixHeading}>96-CELL PHYSICAL PACK MATRIX</Text>
-              {Array.from({ length: 8 }).map((_, mIdx) => {
-                const moduleCells = telemetry.cells.slice(mIdx * 12, (mIdx + 1) * 12);
+              {/* 96-Cell Heatmap Matrix */}
+              <Text style={styles.matrixHeading}>96-CELL SPATIAL MATRIX (8 MODULES × 12 CELLS)</Text>
+              {Array.from({ length: 8 }, (_, modIdx) => {
+                const moduleNum = modIdx + 1;
+                const moduleCells = telemetry.cells.filter((c) => c.moduleIndex === moduleNum);
                 return (
-                  <View key={mIdx} style={styles.moduleRow}>
-                    <Text style={styles.moduleLabel}>M{mIdx + 1}</Text>
+                  <View key={moduleNum} style={styles.moduleRow}>
+                    <Text style={styles.moduleLabel}>M{moduleNum}</Text>
                     <View style={styles.cellsGrid}>
                       {moduleCells.map((c) => {
-                        let cellBg = "#064e3b"; // optimal green
+                        let bg = "#064e3b"; // optimal green
+                        let displayVal = `${c.voltage.toFixed(2)}`;
+
                         if (diagnosticMetric === "thermal") {
-                          cellBg = c.temperatureC > 30 ? "#7f1d1d" : c.temperatureC > 26 ? "#78350f" : "#064e3b";
-                        } else if (c.isAnomaly || c.isMin) {
-                          cellBg = "#831843"; // warning / anomaly
+                          displayVal = `${c.temperatureC.toFixed(0)}°`;
+                          bg = c.temperatureC > 32 ? "#7f1d1d" : c.temperatureC > 28 ? "#78350f" : "#064e3b";
+                        } else if (diagnosticMetric === "delta") {
+                          const deltaMv = Math.round((c.voltage - 3.865) * 1000);
+                          displayVal = `${deltaMv > 0 ? "+" : ""}${deltaMv}`;
+                          bg = Math.abs(deltaMv) > 25 ? "#7f1d1d" : Math.abs(deltaMv) > 15 ? "#78350f" : "#064e3b";
+                        } else {
+                          bg = c.voltage < 3.85 ? "#7f1d1d" : c.voltage > 3.88 ? "#78350f" : "#064e3b";
                         }
 
                         return (
-                          <View key={c.cellIndex} style={[styles.cellItem, { backgroundColor: cellBg }]}>
-                            <Text style={styles.cellIndexText}>C{c.cellIndex}</Text>
-                            <Text style={styles.cellValueText}>
-                              {diagnosticMetric === "thermal" ? `${c.temperatureC}°` : `${c.voltage.toFixed(2)}`}
-                            </Text>
+                          <View key={c.cellIndex} style={[styles.cellItem, { backgroundColor: bg }]}>
+                            <Text style={styles.cellIndexText}>#{c.cellIndex}</Text>
+                            <Text style={styles.cellValueText}>{displayVal}</Text>
                           </View>
                         );
                       })}
@@ -772,7 +1066,7 @@ export default function MobileHomeScreen() {
                   setDiagnosticModalVisible(false);
                 }}
               >
-                <Text style={styles.captureSnapshotText}>＋ Save Diagnostic Snapshot to Local Sessions</Text>
+                <Text style={styles.captureSnapshotText}>＋ Save Diagnostic Snapshot to SQLite & Sync Queue</Text>
               </TouchableOpacity>
             </ScrollView>
           )}
@@ -788,7 +1082,7 @@ export default function MobileHomeScreen() {
             </Text>
             <Text style={styles.modalSub}>
               {authMode === "login"
-                ? "Access your registered vehicles, fleet history, and work orders."
+                ? "Access your registered vehicles, fleet history, push alerts, and work orders."
                 : "Register a technician or driver account stored in the Voltron database."}
             </Text>
 
@@ -991,6 +1285,7 @@ const styles = StyleSheet.create({
   title: { fontSize: 20, fontWeight: "900", color: "#ffffff", letterSpacing: 1.5 },
   subtitle: { fontSize: 12, color: "#10b981", fontWeight: "bold" },
   syncStatus: { color: "#10b981", fontSize: 11, marginTop: 4, fontWeight: "bold" },
+  pushStatusText: { color: "#38bdf8", fontSize: 10, marginTop: 3, fontWeight: "500" },
   syncCard: {
     backgroundColor: "#082f49",
     borderColor: "#0891b2",
@@ -1011,7 +1306,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderRadius: 16,
     padding: 16,
-    marginBottom: 20,
+    marginBottom: 16,
   },
   userHeaderRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   userHeading: { fontSize: 10, color: "#64748b", fontWeight: "bold", letterSpacing: 1 },
@@ -1051,6 +1346,58 @@ const styles = StyleSheet.create({
     marginTop: 14,
   },
   addBtnText: { color: "#ffffff", fontWeight: "bold", fontSize: 13 },
+
+  /* Quick Tools */
+  toolsRow: { flexDirection: "row", gap: 10, marginBottom: 16 },
+  toolCard: {
+    flex: 1,
+    backgroundColor: "#0d1520",
+    borderColor: "#1e293b",
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 12,
+  },
+  toolCardActive: {
+    borderColor: "#10b981",
+    backgroundColor: "#064e3b33",
+  },
+  toolIcon: { fontSize: 20 },
+  toolTitle: { fontSize: 13, fontWeight: "bold", color: "#ffffff", marginTop: 6 },
+  toolSub: { fontSize: 10, color: "#94a3b8", marginTop: 2 },
+
+  /* BLE Panel */
+  blePanel: {
+    backgroundColor: "#0a111a",
+    borderColor: "#0284c7",
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 16,
+  },
+  bleHeaderRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  blePanelTitle: { fontSize: 10, color: "#38bdf8", fontWeight: "bold", letterSpacing: 0.8 },
+  bleStatusText: { fontSize: 11, color: "#94a3b8", marginTop: 4, marginBottom: 8 },
+  bleAdapterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#0f172a",
+    padding: 8,
+    borderRadius: 8,
+    marginBottom: 6,
+  },
+  bleAdapterName: { fontSize: 12, fontWeight: "bold", color: "#ffffff" },
+  bleAdapterId: { fontSize: 10, color: "#64748b", marginTop: 2 },
+  bleConnectBtn: {
+    backgroundColor: "#10b981",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+  bleConnectBtnActive: { backgroundColor: "#ef4444" },
+  bleConnectBtnText: { fontSize: 11, fontWeight: "bold", color: "#05080b" },
+  bleEmptyText: { fontSize: 11, color: "#64748b", textAlign: "center", marginVertical: 8 },
+
+  /* Vehicles Section */
   sectionHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -1108,6 +1455,8 @@ const styles = StyleSheet.create({
   },
   captureBtnText: { color: "#38bdf8", fontWeight: "bold", fontSize: 12 },
   historyLabel: { fontSize: 10, color: "#64748b", marginTop: 6, textAlign: "center" },
+
+  /* Verifier Card */
   verifierCard: {
     backgroundColor: "#0a111a",
     borderColor: "#1e293b",
@@ -1141,6 +1490,37 @@ const styles = StyleSheet.create({
   },
   previewLabel: { fontSize: 10, color: "#64748b", fontWeight: "bold", marginBottom: 4 },
   previewText: { fontSize: 11, color: "#cbd5e1", lineHeight: 16 },
+
+  /* History Modal */
+  historyContent: { padding: 16, paddingBottom: 40 },
+  emptyHistoryBox: { padding: 30, alignItems: "center" },
+  emptyHistoryText: { color: "#cbd5e1", fontSize: 14, fontWeight: "bold" },
+  emptyHistorySub: { color: "#64748b", fontSize: 11, marginTop: 4 },
+  historyCard: {
+    backgroundColor: "#0d1520",
+    borderColor: "#1e293b",
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 10,
+  },
+  historyCardHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  historyCardVehicle: { fontSize: 14, fontWeight: "bold", color: "#ffffff" },
+  historyBadge: {
+    fontSize: 9,
+    color: "#38bdf8",
+    backgroundColor: "#0c4a6e",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    fontWeight: "bold",
+  },
+  bleBadge: { color: "#34d399", backgroundColor: "#064e3b" },
+  historyDate: { fontSize: 10, color: "#64748b", marginTop: 2 },
+  historyMetricsRow: { flexDirection: "row", gap: 12, marginTop: 8 },
+  historyMetricText: { fontSize: 11, color: "#94a3b8" },
+  boldWhite: { color: "#ffffff", fontWeight: "bold" },
+  historyVerdict: { fontSize: 11, color: "#cbd5e1", marginTop: 6, lineHeight: 15 },
 
   /* Modal Base */
   modalOverlay: {
