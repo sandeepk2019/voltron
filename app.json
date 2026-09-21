@@ -1,0 +1,50 @@
+{
+  "expo": {
+    "owner": "skharches-team",
+    "name": "Voltron Diagnostics",
+    "slug": "voltron",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "voltron",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#05080b"
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/85a61248-bd78-4e03-aa9f-d21aa470b6cc",
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 3000
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "im.manus.voltron.diagnostics"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#05080b"
+      },
+      "package": "im.manus.voltron.diagnostics",
+      "permissions": [
+        "CAMERA",
+        "BLUETOOTH",
+        "BLUETOOTH_ADMIN",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_CONNECT",
+        "ACCESS_FINE_LOCATION"
+      ]
+    },
+    "extra": {
+      "backendUrl": "https://3000-ik6yndjw6etkumpv8rpmz-85b2c519.sg2.manus.computer",
+      "eas": {
+        "projectId": "85a61248-bd78-4e03-aa9f-d21aa470b6cc"
+      }
+    },
+    "plugins": [
+      "expo-asset"
+    ]
+  }
+}
